@@ -1,5 +1,5 @@
 # Python-generated files
-__pycache__/
+**/__pycache__/
 *.py[oc]
 build/
 dist/
@@ -12,3 +12,11 @@ wheels/
 # Data
 data
 model_files
+
+# UCE
+UCE/
+UCE-brain/
+
+# Web artifacts (ONNX models and test fixtures)
+web/*.onnx
+web/*.bin

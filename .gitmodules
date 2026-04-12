@@ -1,3 +1,6 @@
 [submodule "UCE"]
 	path = UCE
 	url = https://github.com/snap-stanford/UCE
+[submodule "UCE-brain"]
+	path = UCE-brain
+	url = https://github.com/snap-stanford/UCE-brain
