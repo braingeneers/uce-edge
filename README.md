@@ -96,6 +96,15 @@ Browser INT8 WASM         33 MB    145 ms    0.998706
 4. **CoreML execution provider fails** for both UCE variants (known PyTorch TransformerEncoderLayer export issue). This doesn't block the browser path, which uses WebGPU.
 5. **UCE-brain's smaller architecture** (512 vs 1280 d_model) is the better candidate for edge deployment — 3.5x smaller with equivalent model design.
 
+### Full 33-layer UCE feasibility
+
+The original 33-layer UCE model is not a viable candidate for browser deployment:
+
+- **Size**: The core transformer (excluding the 2.8 GB protein embedding table) is ~870M params = **3.3 GB FP32** as an ONNX file. This exceeds practical WebGPU memory budgets on most machines and is not a reasonable browser download, even cached.
+- **Architecture**: The original UCE uses `batch_first=False` (seq-first tensor layout), which produces ONNX graphs that fail on both CoreML and have not been validated on WebGPU. UCE-brain's `batch_first=True` layout produces a cleaner export that runs correctly.
+- **Compute**: 33 layers at d_model=1280 is roughly **100x** the compute of UCE-brain's 8 layers at d_model=512 (33/8 layer ratio × (1280/512)² attention × (1280/512) FFN). Extrapolating from brain's 14 ms WebGPU time, the 33-layer model would take ~1.4 seconds per forward pass — usable but not interactive.
+- **Design intent**: The 33-layer model was designed for server-side GPU inference. UCE-brain was explicitly designed to be smaller while retaining the same architecture pattern, making it the right candidate for edge deployment.
+
 ### What's not yet covered
 
 - Real scRNA input (experiments use synthetic data to isolate the model inference path)
