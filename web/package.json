@@ -1,0 +1,18 @@
+{
+  "name": "uce-edge-web",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "esbuild src/phase2.ts src/phase3.ts src/phase4.ts src/phase5.ts src/phase6.ts --bundle --format=esm --outdir=dist --sourcemap",
+    "watch": "esbuild src/phase2.ts src/phase3.ts src/phase4.ts src/phase5.ts src/phase6.ts --bundle --format=esm --outdir=dist --sourcemap --watch",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "esbuild": "^0.24.0",
+    "typescript": "^5.6.0"
+  },
+  "dependencies": {
+    "onnxruntime-web": "1.21.0"
+  }
+}

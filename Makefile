@@ -42,6 +42,52 @@ brain-web-bench:
 
 brain-all: brain-baseline brain-onnx-export brain-compare brain-web-bench
 
+brain-extract-embeddings:
+	$(PY) scripts/extract_human_protein_embeddings.py
+
+brain-reference-pipeline:
+	$(PY) scripts/brain_reference_pipeline.py --n-cells 4
+
+brain-phase01: brain-extract-embeddings brain-reference-pipeline
+
+web-install:
+	cd web && npm install
+
+web-typecheck:
+	cd web && npx tsc --noEmit
+
+web-build:
+	cd web && npx esbuild src/phase2.ts src/phase3.ts src/phase4.ts src/phase5.ts src/phase6.ts src/bench.ts --bundle --format=esm --outdir=dist --sourcemap
+	mkdir -p web/dist/ort
+	cp web/node_modules/onnxruntime-web/dist/*.wasm web/node_modules/onnxruntime-web/dist/*.mjs web/dist/ort/ 2>/dev/null || true
+
+web-build-phase2: web-build
+web-build-phase3: web-build
+web-build-phase4: web-build
+web-build-phase5: web-build
+web-build-phase6: web-build
+
+web-serve:
+	$(PY) -m http.server 8765
+
+brain-phase2: web-build
+	$(PY) scripts/brain_web_phase2.py
+
+brain-phase3: web-build
+	$(PY) scripts/brain_web_phase3.py
+
+brain-phase4: web-build
+	$(PY) scripts/brain_web_phase4.py
+
+brain-phase5: web-build
+	$(PY) scripts/brain_web_phase5.py
+
+brain-phase6: web-build
+	$(PY) scripts/brain_web_phase6.py
+
+brain-bench2: web-build
+	$(PY) scripts/brain_web_bench2.py
+
 allen-4layer:
 	python UCE/eval_single_anndata.py \
 		--adata_path data/allen-celltypes+human-cortex+m1-100.h5ad \

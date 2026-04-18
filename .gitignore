@@ -6,6 +6,9 @@ dist/
 wheels/
 *.egg-info
 
+# Mac
+.DS_Store
+
 # Virtual environments
 .venv
 
@@ -20,3 +23,7 @@ UCE-brain/
 # Web artifacts (ONNX models and test fixtures)
 web/*.onnx
 web/*.bin
+
+# Web build artifacts
+web/node_modules/
+web/dist/

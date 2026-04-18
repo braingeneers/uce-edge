@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>UCE-brain Phase 6 — full pipeline from raw counts</title>
+<style>
+  body { font-family: monospace; max-width: 900px; margin: 2em auto; padding: 0 1em; }
+  h2 { margin-bottom: 0.2em; }
+  .subtitle { color: #666; margin-top: 0; }
+  #log { white-space: pre-wrap; background: #111; color: #0f0; padding: 1em; height: 560px; overflow-y: auto; border-radius: 4px; }
+  select, button { font-size: 1em; margin: 0.5em 0; padding: 0.3em 0.8em; }
+  .row { display: flex; gap: 1em; align-items: center; margin-bottom: 0.5em; }
+</style>
+</head>
+<body>
+<h2>UCE-brain — Phase 6</h2>
+<p class="subtitle">Full pipeline in the browser: raw counts → log1p + sum-to-1 normalize → weighted sample → chrom shuffle → sentence → gather → transformer. Python provides only raw counts + reference cell embedding. Weights match Python to Float32 eps; cell embeddings at Phase 5 noise floor.</p>
+<div class="row">
+  <label>Backend:
+    <select id="backend">
+      <option value="webgpu">WebGPU</option>
+      <option value="wasm">WASM (CPU)</option>
+    </select>
+  </label>
+  <button id="run">Run</button>
+  <button id="clear-cache">Clear cache</button>
+</div>
+<div id="log"></div>
+<script type="module" src="dist/phase6.js"></script>
+</body>
+</html>

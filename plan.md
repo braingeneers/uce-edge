@@ -1,5 +1,9 @@
 # UCE-brain browser deployment — phased plan
 
+## Status: Phases 0–6 complete (2026-04-18)
+
+All six preprocessing phases are implemented and passing on WebGPU. The full UCE-brain pipeline (stages 1–7 + transformer) now runs end-to-end in the browser from raw counts. End-to-end performance: **~215 ms/cell on WebGPU** (vs 327 ms/cell PyTorch CPU FP32 native). See "Performance & optimization headroom" at the bottom for next steps.
+
 ## Goal
 
 Run the full UCE-brain inference pipeline (not just the transformer) in a web browser, matching the Python reference output. The transformer already runs at 14ms FP32 on WebGPU with bit-perfect fidelity. This plan adds the preprocessing stages incrementally.
@@ -53,7 +57,7 @@ Stages 2 and 7 could live inside the ONNX graph but we keep them in JS to keep t
 
 ---
 
-## Phase 0 — Extract human protein embedding table
+## Phase 0 — Extract human protein embedding table [DONE]
 
 **Deliverables**:
 - `scripts/extract_human_protein_embeddings.py`
@@ -71,7 +75,7 @@ Stages 2 and 7 could live inside the ONNX graph but we keep them in JS to keep t
 
 ---
 
-## Phase 1 — Python reference pipeline on real h5ad
+## Phase 1 — Python reference pipeline on real h5ad [DONE]
 
 **Deliverables**:
 - `scripts/brain_reference_pipeline.py`
@@ -99,7 +103,7 @@ N = number of cells to test (start with 4 for manageable fixture sizes; src_embe
 
 ---
 
-## Phase 2 — Browser: transformer only (from pre-embedded input)
+## Phase 2 — Browser: transformer only (from pre-embedded input) [DONE]
 
 **Deliverables**:
 - `web/phase2.html`
@@ -115,7 +119,7 @@ N = number of cells to test (start with 4 for manageable fixture sizes; src_embe
 
 ---
 
-## Phase 3 — Browser: protein embedding gather + transformer
+## Phase 3 — Browser: protein embedding gather + transformer [DONE]
 
 **Deliverables**:
 - `web/phase3.html` — adds IndexedDB caching of the 400 MB embedding table
@@ -137,7 +141,7 @@ N = number of cells to test (start with 4 for manageable fixture sizes; src_embe
 
 ---
 
-## Phase 4 — Browser: chromosome ordering + CLS/PAD + gather + transformer
+## Phase 4 — Browser: chromosome ordering + CLS/PAD + gather + transformer [DONE]
 
 **Deliverables**:
 - `web/phase4.html`
@@ -158,7 +162,7 @@ N = number of cells to test (start with 4 for manageable fixture sizes; src_embe
 
 ---
 
-## Phase 5 — Browser: weighted sampling + rest
+## Phase 5 — Browser: weighted sampling + rest [DONE]
 
 **Deliverables**:
 - `web/phase5.html`
@@ -170,14 +174,14 @@ N = number of cells to test (start with 4 for manageable fixture sizes; src_embe
 
 **Validation** — *this is the first phase where bit-identity fails*:
 - Cannot expect element-wise match since JS RNG differs from numpy's `Generator`.
-- Instead: for a batch of cells, measure cos(JS cell_embedding, Python cell_embedding). Expect mean cos > 0.99, individual cells > 0.95.
-- Sanity: sampling distribution check. For a cell, run JS sampler 1000 times, compute histogram of sampled genes, compare shape to Python's histogram. Should be visibly similar (Pearson correlation > 0.95).
+- Instead: for a batch of cells, measure cos(JS cell_embedding, Python cell_embedding). Targets are set against the **intrinsic seed-noise floor** — the cos you get running Python twice with different seeds. Empirically on this h5ad that floor is ~0.89–0.97 per cell (sparse cells are more gene-selection sensitive). So: mean cos > 0.90, individual cells > 0.88, and the JS results should not be materially worse than Python-vs-Python at the same seeds.
+- Sanity: sampling distribution check. For a cell, run JS sampler 1000 times, compute histogram of sampled genes, compare shape to expected (`weights * trials * sample_size`). Pearson > 0.95 — this is the one that actually proves the sampler is correct. If histogram passes and per-cell cos is still low, the model is just gene-selection-sensitive (expected).
 
-**Risk**: if cos << 0.99 here, either the sampler distribution is off (diagnosable via histogram), or the model is more sensitive to gene selection than we thought. Having the histogram check built in separates these cases cleanly.
+**Risk**: if histogram Pearson < 0.95, the sampler distribution is broken. If histogram passes but per-cell cos is dramatically worse than Python-vs-Python noise floor, something else (e.g. chrom-shuffle ordering) differs. Having both checks separates these cases cleanly.
 
 ---
 
-## Phase 6 — Browser: full pipeline from raw counts
+## Phase 6 — Browser: full pipeline from raw counts [DONE]
 
 **Deliverables**:
 - `web/phase6.html` / `web/index.html` (this becomes the real demo)
@@ -227,3 +231,57 @@ data/
 Each phase replaces one Python stage with a JS stage. The boundary between "Python did this" and "JS did this" shifts earlier each phase. The validation at each phase compares the JS-computed output against the corresponding Python fixture from Phase 1.
 
 Until Phase 5, all comparisons are element-wise (no randomness in JS yet). Phase 5 is where we lose bit-identity due to RNG differences; from there we switch to cosine similarity on the final cell embedding plus distributional checks on the intermediate sampler.
+
+---
+
+## Performance & optimization headroom (post-Phase-6)
+
+### Current numbers (measured, Apple Silicon M-series, headless Chromium)
+
+End-to-end, from raw counts to cell embedding:
+- **215 ms/cell** on WebGPU (batch=1, FP32)
+  - normalize (log1p + sum-to-1): 0.3 ms
+  - sample + chrom-shuffle + sentence build: 0.5 ms
+  - gather + transformer: 214 ms
+- Reference: PyTorch CPU FP32 native = 327 ms/cell (so WebGPU in browser is already 1.5× faster than a local Python reference)
+
+First-visit cost: ~400 MB model + embedding table download (then HTTP-cached). Per-tab GPU memory peak: ~1 GB.
+
+### What we measured and ruled out
+
+Backend bench harness: `web/src/bench.ts` + `scripts/brain_web_bench2.py`. All results below are per-cell, seq_len=2048, FP32 unless noted.
+
+| Config | ms/cell | Notes |
+|---|---|---|
+| **WebGPU batch=1** | **215** | baseline |
+| WebGPU batch=2 | 452 | O(L²) attention, batching hurts |
+| WebGPU batch=4 | 349 | still hurts per cell |
+| WebGPU int8 | 949 | quant model not GPU-optimized |
+| WebGPU graph_opt=all | 215 | no gain (model already fused at export) |
+| WASM simd 1 thread | 1341 | baseline CPU path |
+| WASM simd 4 threads | 1354 | threading does not help |
+| WASM simd 10 threads | 1394 | saturated / synchronization overhead |
+| WASM int8 4 threads | 2967 | worse than fp32 |
+
+**Gotcha**: WASM threading requires cross-origin isolation (COOP/COEP headers → SharedArrayBuffer). Without those, ORT silently falls back to single-thread regardless of `numThreads` setting. The dev server in `scripts/brain_web_bench2.py` sends these headers; a deployed app must too.
+
+Conclusion: WebGPU batch=1 FP32 is the right default. Threading, batching, int8, and graph-opt levels do not move the needle at this model shape.
+
+### Optimization roadmap (next phases, ranked effort:payoff)
+
+**Phase 7 — Dynamic seq_len (skip padded tokens).** Biggest single win. Real cells have ~1100 valid tokens out of 2048 (1 CLS + 1024 genes + ~30 chrom boundaries). The ONNX graph currently processes all 2048 with an attention mask. Re-exporting with `seq_len = attention_mask.sum()` and trimming the batch dim cuts attention work ~3× (O(L²) → O(L'²) with L'/L ≈ 0.55). **Estimated: 80–100 ms/cell.** Risk: batched inference becomes jagged — acceptable because batch=1 is the right default anyway. Needs: re-export `brain_Nl_fp32.onnx` with dynamic axes, update JS to slice src + mask to the valid prefix.
+
+**Phase 8 — FP16 WebGPU weights.** Transformer is memory-bandwidth-bound on GPU; halving weight bytes should roughly halve kernel time. ORT-Web has a mature FP16 WebGPU EP for transformers. **Estimated: 100–130 ms/cell (combines with Phase 7 to reach ~60 ms/cell).** Risk: accuracy drift — needs a calibration run and a per-cell cos check against FP32. Needs: re-export with FP16 conversion (`onnxconverter-common`) + session option `executionProviders: [{ name: 'webgpu', preferredLayout: 'NHWC' }]` or equivalent.
+
+**Phase 9 — Persistent session + GPU-resident embedding table.** Two things: (a) allocate the 400 MB `human_protein_embeddings.bin` as a WebGPU buffer once, do the gather on GPU instead of shipping src through the CPU each call; (b) pool the src/mask tensors across runs to avoid per-call allocation. **Estimated: 20–40 ms/cell + much lower CPU memory churn.** Risk: modest, just plumbing — `ort.Tensor.fromGpuBuffer` + a tiny gather shader. Needs: gather compute shader in WebGPU, session option `preferredOutputLocation: 'gpu-buffer'` for intermediate outputs, explicit `.getData()` for the final cell embedding.
+
+**Phase 10 — Graph capture.** `sessionOpts: { enableGraphCapture: true }` reuses compiled shader bundles between runs when shapes are stable. ORT docs claim 10–30%. Only meaningful after Phase 7 (needs shape-stable inputs). **Estimated: 20–40 ms/cell.** Risk: none, it's a flag.
+
+**UX, not perf — service-worker cache the 400 MB bundle.** First-visit is the real UX cost. Worth doing once we have a real demo page.
+
+### Not pursuing
+
+- WASM threading: bench shows no gain and may hurt.
+- Batching at the UCE-brain model's current shape: O(L²) attention makes per-cell cost worse.
+- int8 quantization as it exists today: the shipped int8 model isn't GPU-optimized and hurts on both backends. Would need recalibration + static int8 WebGPU EP (not yet mature in ORT-Web).
+- Native (non-web) deployment: out of scope; the point is browser inference.
