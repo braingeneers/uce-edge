@@ -2,7 +2,7 @@
 
 ## Status: Phases 0–7 complete (2026-04-18)
 
-All six preprocessing phases plus the dynamic seq_len optimization are implemented and passing on WebGPU. The full UCE-brain pipeline (stages 1–7 + transformer) now runs end-to-end in the browser from raw counts. End-to-end performance: **~111 ms/cell on WebGPU** (measured over 100 cells; was 215 ms/cell before Phase 7; vs 327 ms/cell PyTorch CPU FP32 native). See "Performance & optimization headroom" at the bottom for remaining optimizations.
+All six preprocessing phases plus the dynamic seq_len optimization are implemented and passing on WebGPU. The full UCE-brain pipeline (stages 1–7 + transformer) now runs end-to-end in the browser from raw counts. End-to-end performance: **~111 ms/cell on WebGPU** (measured over 100 cells; was 215 ms/cell before Phase 7). Apples-to-apples against native PyTorch MPS on the same M4 GPU at the same shape: **139 ms/cell** — so browser is **1.26× faster than native PyTorch on the same Apple GPU**. See "Performance & optimization headroom" at the bottom for remaining optimizations.
 
 ## Goal
 
@@ -270,7 +270,17 @@ End-to-end, from raw counts to cell embedding:
   - sample + chrom-shuffle + sentence build: 0.2 ms
   - gather + transformer: 110.7 ms
 - Pre-Phase-7 baseline (fixed pad_length=2048): 215 ms/cell → Phase 7 delivered **1.9× speedup**.
-- Reference: PyTorch CPU FP32 native = 327 ms/cell (browser is now ~3× faster than a local Python reference).
+
+### Apples-to-apples: browser WebGPU vs native PyTorch MPS
+
+Same Apple M4 GPU, transformer forward only, batch=1, FP32 (`scripts/brain_baseline.py`):
+
+| shape | PyTorch MPS | Browser WebGPU | browser speedup |
+|---|---|---|---|
+| seq_len=1072 (Phase 7 dynamic) | 138.9 ms | 110.7 ms | **1.26×** |
+| seq_len=2048 (fixed pad) | 295.1 ms | 215 ms | **1.37×** |
+
+The browser is faster than native PyTorch on the same GPU. Why: ORT-Web's WebGPU kernels are more aggressively fused for transformer inference at batch=1 than PyTorch MPS kernels, which are tuned more for training-shaped workloads. This was the measurement we'd been missing — the earlier "browser is 3× faster than PyTorch" number was vs CPU FP32, which isn't the right baseline if the user has a GPU.
 
 First-visit cost: ~400 MB model + embedding table download (then HTTP-cached). Per-tab GPU memory peak: ~1 GB.
 

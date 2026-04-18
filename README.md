@@ -4,7 +4,7 @@ Exploring whether [UCE](https://github.com/snap-stanford/UCE) (Universal Cell Em
 
 ## Status
 
-The full UCE-brain pipeline (log1p normalize → weighted sampling → chromosome ordering → CLS/CHROM/PAD inserts → protein embedding gather → 8-layer transformer) now runs end-to-end in the browser on WebGPU, validated against a Python reference at every stage. **111 ms/cell** end-to-end with dynamic seq_len (~1071 valid tokens of 2048 padded), vs 327 ms/cell PyTorch CPU FP32 native — the browser is now ~3× faster than the local Python reference. See [plan.md](plan.md) for the phased build-out and remaining optimization roadmap.
+The full UCE-brain pipeline (log1p normalize → weighted sampling → chromosome ordering → CLS/CHROM/PAD inserts → protein embedding gather → 8-layer transformer) now runs end-to-end in the browser on WebGPU, validated against a Python reference at every stage. **111 ms/cell** in the browser (WebGPU) at seq_len=1072 vs **139 ms/cell** in native PyTorch (MPS) at the same shape — i.e. the browser is **1.26× faster than native PyTorch on the same Apple GPU**. See [plan.md](plan.md) for the phased build-out and remaining optimization roadmap.
 
 ## Repository structure
 
@@ -127,13 +127,22 @@ gather + transformer (WebGPU)  110.7 ms
 total per cell                 ~111 ms   (seq_len=1071 valid of 2048 padded)
 ```
 
-Phase 6 vs Phase 7 (dynamic seq_len — skip padded tokens in attention):
+Apples-to-apples GPU comparison (transformer forward, same Apple M4 GPU, batch=1, FP32, `scripts/brain_baseline.py`):
+
+```
+shape                           PyTorch MPS   Browser WebGPU   browser speedup
+seq_len=1072 (dynamic)          138.9 ms      110.7 ms         1.26×
+seq_len=2048 (fixed pad)        295.1 ms      215   ms         1.37×
+```
+
+Browser is consistently faster than native PyTorch on the same GPU — ORT-Web's WebGPU shader kernels beat PyTorch's MPS kernels for this model at batch=1. Dynamic seq_len (Phase 7) wins for both backends.
+
+Phase 6 vs Phase 7 on WebGPU (dynamic seq_len — skip padded tokens in attention):
 
 ```
 config                          ms/cell
 Phase 6 (fixed seq_len=2048)    215
 Phase 7 (dynamic seq_len≈1071)  111   ← default, 1.9× faster
-PyTorch CPU FP32 (reference)    327   ← browser is 3× faster
 ```
 
 Backend comparison at seq_len=2048 (from `make brain-bench2`, pre-Phase-7):
@@ -154,7 +163,7 @@ WASM SIMD 10 threads            1394
 1. **Full pipeline in the browser works.** Not just the transformer — log1p/normalize, weighted sampling with an in-JS RNG, chromosome ordering, and gather all run in TypeScript with cosine similarity against Python within the intrinsic RNG noise floor (per-cell cos 0.89–0.97 on the allen-cortex h5ad; Python-vs-Python at different seeds sits in the same range).
 2. **Dynamic seq_len is the cheapest big win.** Real cells use ~52% of the padded 2048 tokens (mean 1071 valid). Since the exported ONNX graph already has dynamic axes, trimming src + mask to the valid prefix per cell cuts attention work ~3.65× and end-to-end time ~2× with zero accuracy cost. No re-export needed.
 3. **WebGPU batch=1 FP32 is the right default.** Batching hurts per-cell (O(L²) attention), INT8 regresses (no GPU-native int8 kernels), and WASM threading is flat. Graph-optimization levels make no difference — the exported model is already fused.
-4. **FP32 in the browser is faster than local PyTorch CPU.** 111 ms/cell WebGPU with dynamic seq_len vs 327 ms/cell PyTorch CPU FP32 on the same hardware. A 100-cell h5ad processes in ~11 s in-browser.
+4. **Browser is faster than native PyTorch on the same GPU.** 111 ms/cell WebGPU vs 139 ms/cell PyTorch MPS at the same shape (batch=1, seq_len=1072, FP32) — 1.26× on the Apple M4 GPU. 295 ms/cell MPS vs 215 ms/cell WebGPU at the pre-Phase-7 fixed 2048 shape — 1.37×. ORT-Web's WebGPU kernels beat PyTorch MPS for this workload. A 100-cell h5ad processes in ~11 s in-browser.
 5. **Gather-upfront doesn't scale to 100 cells.** At seq_len=2048 × emb_dim=5120 × 100 cells × 4 bytes = 4.2 GB, which OOMs the tab. Moving gather inside the per-cell loop keeps the working set to ~22 MB per cell (and becomes the natural site for a future GPU-resident embedding table).
 6. **First-visit cost is the real UX issue.** ~400 MB protein embedding table + 117 MB model download, then HTTP-cached. Runtime per-tab GPU peak ~1 GB.
 7. **WASM threading requires cross-origin isolation.** Without COOP/COEP headers, `ort.env.wasm.numThreads` is silently ignored. The dev server in `scripts/brain_web_bench2.py` sends the right headers; a deployed app must too. Even with threading properly enabled it didn't help this model.
