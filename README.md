@@ -182,9 +182,9 @@ Ranked effort:payoff — see [plan.md](plan.md) for detail:
 
 The original 33-layer UCE model is not a viable candidate for browser deployment:
 
-- **Size**: The core transformer (excluding the 2.8 GB protein embedding table) is ~870M params = **3.3 GB FP32** as an ONNX file. This exceeds practical WebGPU memory budgets on most machines and is not a reasonable browser download, even cached.
+- **Size**: The core transformer (excluding the 2.8 GB protein embedding table) is ~870M params = **3.3 GB FP32** as an ONNX file. This exceeds practical WebGPU memory budgets on most machines and is not a reasonable browser download, even cached. FP16 halves that to ~1.7 GB — borderline-feasible on 8 GB machines but still a painful first-visit download.
 - **Architecture**: The original UCE uses `batch_first=False` (seq-first tensor layout), which produces ONNX graphs that fail on both CoreML and have not been validated on WebGPU. UCE-brain's `batch_first=True` layout produces a cleaner export that runs correctly.
-- **Compute**: 33 layers at d_model=1280 is roughly **100x** the compute of UCE-brain's 8 layers at d_model=512 (33/8 layer ratio × (1280/512)² attention × (1280/512) FFN). Extrapolating from brain's 14 ms WebGPU time, the 33-layer model would take ~1.4 seconds per forward pass — usable but not interactive.
+- **Compute**: 33 layers at d_model=1280 is roughly **~26×** the compute of UCE-brain's 8 layers at d_model=512 — from the 8→33 layer ratio (4.1×) combined with (1280/512)² = 6.25× per-layer cost (attention + FFN both scale with d_model²). Projecting from our measured **111 ms/cell** WebGPU FP32 with the Phase 7 dynamic seq_len optimization: **~2.9 s/cell** FP32, or **~1.5 s/cell** with FP16 (Phase 8) once implemented. A 100-cell h5ad would take 2.5–5 minutes in-browser — usable for a "paste and wait" workflow, not interactive. This assumes the `batch_first=False` export can actually be made to run on WebGPU, which is itself unresolved.
 - **Design intent**: The 33-layer model was designed for server-side GPU inference. UCE-brain was explicitly designed to be smaller while retaining the same architecture pattern, making it the right candidate for edge deployment.
 
 ### What's not yet covered
