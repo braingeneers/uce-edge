@@ -1,8 +1,8 @@
 # UCE-brain browser deployment — phased plan
 
-## Status: Phases 0–6 complete (2026-04-18)
+## Status: Phases 0–7 complete (2026-04-18)
 
-All six preprocessing phases are implemented and passing on WebGPU. The full UCE-brain pipeline (stages 1–7 + transformer) now runs end-to-end in the browser from raw counts. End-to-end performance: **~215 ms/cell on WebGPU** (vs 327 ms/cell PyTorch CPU FP32 native). See "Performance & optimization headroom" at the bottom for next steps.
+All six preprocessing phases plus the dynamic seq_len optimization are implemented and passing on WebGPU. The full UCE-brain pipeline (stages 1–7 + transformer) now runs end-to-end in the browser from raw counts. End-to-end performance: **~111 ms/cell on WebGPU** (measured over 100 cells; was 215 ms/cell before Phase 7; vs 327 ms/cell PyTorch CPU FP32 native). See "Performance & optimization headroom" at the bottom for remaining optimizations.
 
 ## Goal
 
@@ -195,6 +195,32 @@ N = number of cells to test (start with 4 for manageable fixture sizes; src_embe
 
 ---
 
+## Phase 7 — Dynamic seq_len (skip padded tokens) [DONE]
+
+**Deliverables**:
+- `web/src/phase6.ts` updated to slice `src` + `mask` to the valid prefix length per cell before calling `runBrain`.
+- `scripts/brain_reference_pipeline.py` scaled to 100 cells with a `--skip-src-embeddings` flag (the per-cell 40 MB fixture wasn't needed after Phase 3), and valid-token stats added to `manifest.json`.
+- Per-cell `seq_len_used` recorded in `window.phase6Result`; Playwright driver logs min/max/mean.
+
+**What**: Padding in UCE-brain is always at the sentence tail, so the valid prefix length is `sum(attention_mask)`. The exported ONNX graph already had dynamic `seq_len` axes (from `brain_onnx_export.py`), so nothing needed re-exporting — purely a JS-side change to slice inputs per cell.
+
+**Gotcha discovered during implementation**: at `n_cells=100` the old "gather all cells upfront" path allocated `100 × 2048 × 5120 × 4 = 4.2 GB` for `src` and OOM'd the Chromium tab. Fixed by moving the gather *inside* the per-cell loop (one `validLen × 5120 × 4 ≈ 22 MB` buffer per cell instead).
+
+**Measured** (100 cells, `allen-celltypes+human-cortex+m1-100.h5ad`, WebGPU, M4):
+
+| metric | value |
+|---|---|
+| seq_len used | 1071 mean (1071–1073), pad=2048 → 52.3% utilization |
+| mean transformer time/cell | **110.7 ms** (was 215 ms → 1.9× speedup) |
+| min cosine vs Python | 0.891 |
+| mean cosine vs Python | 0.953 |
+| histogram pearson (sampler check) | 0.9975 |
+| weights max\|diff\| (normalize check) | 2.3e-10 |
+
+Speedup came in under the theoretical 3.65× attention-only ratio because MLPs and per-call overhead are O(L), not O(L²), and 100 cells is enough cells that per-call fixed costs (tensor setup, kernel dispatch) show up.
+
+---
+
 ## Out of scope for this plan
 
 - Loading h5ad directly in the browser. Assume the caller provides `(gene_symbols[], counts[N,G])` in memory, however it got there. (The existing project has h5ad reading solved.)
@@ -234,16 +260,17 @@ Until Phase 5, all comparisons are element-wise (no randomness in JS yet). Phase
 
 ---
 
-## Performance & optimization headroom (post-Phase-6)
+## Performance & optimization headroom (post-Phase-7)
 
-### Current numbers (measured, Apple Silicon M-series, headless Chromium)
+### Current numbers (measured, Apple Silicon M4, headless Chromium, 100 cells)
 
 End-to-end, from raw counts to cell embedding:
-- **215 ms/cell** on WebGPU (batch=1, FP32)
-  - normalize (log1p + sum-to-1): 0.3 ms
-  - sample + chrom-shuffle + sentence build: 0.5 ms
-  - gather + transformer: 214 ms
-- Reference: PyTorch CPU FP32 native = 327 ms/cell (so WebGPU in browser is already 1.5× faster than a local Python reference)
+- **111 ms/cell** on WebGPU (batch=1, FP32, dynamic seq_len ≈ 1071)
+  - normalize (log1p + sum-to-1): 0.1 ms
+  - sample + chrom-shuffle + sentence build: 0.2 ms
+  - gather + transformer: 110.7 ms
+- Pre-Phase-7 baseline (fixed pad_length=2048): 215 ms/cell → Phase 7 delivered **1.9× speedup**.
+- Reference: PyTorch CPU FP32 native = 327 ms/cell (browser is now ~3× faster than a local Python reference).
 
 First-visit cost: ~400 MB model + embedding table download (then HTTP-cached). Per-tab GPU memory peak: ~1 GB.
 
@@ -267,15 +294,13 @@ Backend bench harness: `web/src/bench.ts` + `scripts/brain_web_bench2.py`. All r
 
 Conclusion: WebGPU batch=1 FP32 is the right default. Threading, batching, int8, and graph-opt levels do not move the needle at this model shape.
 
-### Optimization roadmap (next phases, ranked effort:payoff)
+### Optimization roadmap (remaining phases, ranked effort:payoff)
 
-**Phase 7 — Dynamic seq_len (skip padded tokens).** Biggest single win. Real cells have ~1100 valid tokens out of 2048 (1 CLS + 1024 genes + ~30 chrom boundaries). The ONNX graph currently processes all 2048 with an attention mask. Re-exporting with `seq_len = attention_mask.sum()` and trimming the batch dim cuts attention work ~3× (O(L²) → O(L'²) with L'/L ≈ 0.55). **Estimated: 80–100 ms/cell.** Risk: batched inference becomes jagged — acceptable because batch=1 is the right default anyway. Needs: re-export `brain_Nl_fp32.onnx` with dynamic axes, update JS to slice src + mask to the valid prefix.
+**Phase 8 — FP16 WebGPU weights.** Transformer is memory-bandwidth-bound on GPU; halving weight bytes should roughly halve kernel time. ORT-Web has a mature FP16 WebGPU EP for transformers. **Estimated: ~60 ms/cell (on top of Phase 7).** Risk: accuracy drift — needs a calibration run and a per-cell cos check against FP32. Needs: re-export with FP16 conversion (`onnxconverter-common`) + session option `executionProviders: [{ name: 'webgpu', preferredLayout: 'NHWC' }]` or equivalent.
 
-**Phase 8 — FP16 WebGPU weights.** Transformer is memory-bandwidth-bound on GPU; halving weight bytes should roughly halve kernel time. ORT-Web has a mature FP16 WebGPU EP for transformers. **Estimated: 100–130 ms/cell (combines with Phase 7 to reach ~60 ms/cell).** Risk: accuracy drift — needs a calibration run and a per-cell cos check against FP32. Needs: re-export with FP16 conversion (`onnxconverter-common`) + session option `executionProviders: [{ name: 'webgpu', preferredLayout: 'NHWC' }]` or equivalent.
+**Phase 9 — Persistent session + GPU-resident embedding table.** Two things: (a) allocate the 400 MB `human_protein_embeddings.bin` as a WebGPU buffer once, do the gather on GPU instead of shipping src through the CPU each call; (b) pool the src/mask tensors across runs to avoid per-call allocation. Already partially motivated by the Phase-7 gather-inside-loop refactor (the per-cell gather copy is now ~22 MB instead of 4.2 GB upfront, but still a CPU→GPU ship per call). **Estimated: 15–30 ms/cell savings + much lower CPU memory churn.** Risk: modest, just plumbing — `ort.Tensor.fromGpuBuffer` + a tiny gather shader. Needs: gather compute shader in WebGPU, session option `preferredOutputLocation: 'gpu-buffer'` for intermediate outputs, explicit `.getData()` for the final cell embedding.
 
-**Phase 9 — Persistent session + GPU-resident embedding table.** Two things: (a) allocate the 400 MB `human_protein_embeddings.bin` as a WebGPU buffer once, do the gather on GPU instead of shipping src through the CPU each call; (b) pool the src/mask tensors across runs to avoid per-call allocation. **Estimated: 20–40 ms/cell + much lower CPU memory churn.** Risk: modest, just plumbing — `ort.Tensor.fromGpuBuffer` + a tiny gather shader. Needs: gather compute shader in WebGPU, session option `preferredOutputLocation: 'gpu-buffer'` for intermediate outputs, explicit `.getData()` for the final cell embedding.
-
-**Phase 10 — Graph capture.** `sessionOpts: { enableGraphCapture: true }` reuses compiled shader bundles between runs when shapes are stable. ORT docs claim 10–30%. Only meaningful after Phase 7 (needs shape-stable inputs). **Estimated: 20–40 ms/cell.** Risk: none, it's a flag.
+**Phase 10 — Graph capture.** `sessionOpts: { enableGraphCapture: true }` reuses compiled shader bundles between runs when shapes are stable. ORT docs claim 10–30%. Valid seq_len varies by ±2 across cells (1071–1073 in the test set), so we'd need to pad to a small fixed bucket (e.g. round up to nearest 16) before this is useful. **Estimated: 10–30 ms/cell.** Risk: low, it's a flag + small padding logic.
 
 **UX, not perf — service-worker cache the 400 MB bundle.** First-visit is the real UX cost. Worth doing once we have a real demo page.
 

@@ -46,7 +46,7 @@ brain-extract-embeddings:
 	$(PY) scripts/extract_human_protein_embeddings.py
 
 brain-reference-pipeline:
-	$(PY) scripts/brain_reference_pipeline.py --n-cells 4
+	$(PY) scripts/brain_reference_pipeline.py --n-cells 100 --skip-src-embeddings
 
 brain-phase01: brain-extract-embeddings brain-reference-pipeline
 

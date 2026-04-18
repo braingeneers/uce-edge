@@ -1,10 +1,17 @@
 /**
- * Phase 6: Full browser pipeline from raw counts.
+ * Phase 6: Full browser pipeline from raw counts + dynamic seq_len (Phase 7
+ * optimization folded in here since it's trivial once the valid-length is
+ * known at sentence-build time).
  *
  * JS does stages 1-7: log1p + sum-to-1 normalize, weighted sampling, chrom
  * shuffle, sentence build, gather, transformer. Python provides only the raw
  * counts (as if caller loaded an h5ad into memory) and the reference cell
  * embedding.
+ *
+ * Dynamic seq_len: padding is always at the sentence tail, so we trim src +
+ * mask to the valid prefix length before calling the ONNX session. The
+ * exported model has dynamic seq_len axes so no re-export is needed. At
+ * ~1072 valid tokens vs 2048 pad_length this cuts attention work ~3.65x.
  *
  * Validation:
  *   - weights: element-wise vs ref_normalized_weights.bin (should be ~1e-7)
@@ -153,38 +160,63 @@ async function run(backend: Backend): Promise<void> {
   const buildMs = performance.now() - tBuild0;
   log(`  build: ${buildMs.toFixed(0)} ms total`);
 
-  log("gathering embeddings");
-  const src = gather(embeddingTable, tableRows, embDim, tokenIdsAll, n_cells, L);
+  // Compute per-cell valid length from the attention mask. Padding is always
+  // at the tail, so the valid prefix length == sum(mask). Gather happens
+  // inside the per-cell loop below to avoid a 4GB one-shot allocation at
+  // n_cells=100.
+  const validLens = new Int32Array(n_cells);
+  for (let c = 0; c < n_cells; c++) {
+    let v = 0;
+    const off = c * L;
+    for (let j = 0; j < L; j++) v += attnMaskAll[off + j];
+    validLens[c] = v;
+  }
+  let vMin = validLens[0], vMax = validLens[0], vSum = 0;
+  for (let c = 0; c < n_cells; c++) {
+    const v = validLens[c];
+    if (v < vMin) vMin = v;
+    if (v > vMax) vMax = v;
+    vSum += v;
+  }
+  const vMean = vSum / n_cells;
+  log(`  valid seq_len: min=${vMin}  max=${vMax}  mean=${vMean.toFixed(1)}  (pad_length=${L}, utilization=${(vMean/L*100).toFixed(1)}%)`);
 
   log(`creating ONNX session (${backend})`);
   const session = await createBrainSession(MODEL_URL, backend);
 
-  const results: { cell: number; cos: number; maxDiff: number; ms: number }[] = [];
-  const srcStride = L * D;
+  const results: { cell: number; cos: number; maxDiff: number; ms: number; seqLen: number }[] = [];
   const maskStride = L;
   const cellStride = d_model;
 
-  // Warmup.
+  // Warmup at the expected valid length.
+  const warmupLen = validLens[0];
+  const warmupIds = tokenIdsAll.subarray(0, warmupLen);
+  const warmupSrc = gather(embeddingTable, tableRows, embDim, warmupIds, 1, warmupLen);
   await runBrain(
     session,
-    src.subarray(0, srcStride),
-    attnMaskAll.subarray(0, maskStride),
-    1, L, D
+    warmupSrc,
+    attnMaskAll.subarray(0, warmupLen),
+    1, warmupLen, D
   );
 
+  const verbose = n_cells <= 10;
   for (let i = 0; i < n_cells; i++) {
-    const srcBatch = src.slice(i * srcStride, (i + 1) * srcStride);
-    const maskBatch = attnMaskAll.slice(i * maskStride, (i + 1) * maskStride);
+    const validLen = validLens[i];
+    const idsSlice = tokenIdsAll.subarray(i * L, i * L + validLen);
+    const srcBatch = gather(embeddingTable, tableRows, embDim, idsSlice, 1, validLen);
+    const maskBatch = attnMaskAll.slice(i * maskStride, i * maskStride + validLen);
     const refSlice = refCell.subarray(i * cellStride, (i + 1) * cellStride);
 
     const tStart = performance.now();
-    const { cell } = await runBrain(session, srcBatch, maskBatch, 1, L, D);
+    const { cell } = await runBrain(session, srcBatch, maskBatch, 1, validLen, D);
     const ms = performance.now() - tStart;
 
     const cos = cosine(cell, refSlice);
     const md = maxAbsDiff(cell, refSlice);
-    results.push({ cell: i, cos, maxDiff: md, ms });
-    log(`  cell ${i}: cos=${cos.toFixed(6)}  maxdiff=${md.toExponential(2)}  ${ms.toFixed(1)} ms`);
+    results.push({ cell: i, cos, maxDiff: md, ms, seqLen: validLen });
+    if (verbose || i % 10 === 0 || i === n_cells - 1) {
+      log(`  cell ${i}: seq_len=${validLen}  cos=${cos.toFixed(6)}  maxdiff=${md.toExponential(2)}  ${ms.toFixed(1)} ms`);
+    }
   }
 
   const minCos = Math.min(...results.map((r) => r.cos));
@@ -213,7 +245,7 @@ async function run(backend: Backend): Promise<void> {
   log(`  mean cosine:  ${meanCos.toFixed(6)}      (target > 0.90)`);
   log(`  hist pearson: ${r.toFixed(4)}           (target > 0.95)`);
   log(`  normalize:    ${normMs.toFixed(1)} ms total`);
-  log(`  mean per-cell transformer: ${meanMs.toFixed(1)} ms`);
+  log(`  mean per-cell transformer: ${meanMs.toFixed(1)} ms  (seq_len mean=${vMean.toFixed(1)}, pad=${L})`);
   // Phase 6 floor == Phase 5 floor (normalize is deterministic; drift source
   // is still the JS vs numpy sampler). Weights diff should be near Float32 eps.
   const pass =
@@ -234,6 +266,10 @@ async function run(backend: Backend): Promise<void> {
     normalize_ms: normMs,
     build_ms: buildMs,
     mean_ms: meanMs,
+    seq_len_pad: L,
+    seq_len_min: vMin,
+    seq_len_max: vMax,
+    seq_len_mean: vMean,
     per_cell: results,
   };
 }

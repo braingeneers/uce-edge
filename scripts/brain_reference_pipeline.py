@@ -93,8 +93,12 @@ def main():
     ap.add_argument("--renumbered", type=Path, default=DEFAULT_RENUMBERED,
                     help="Phase 0 output: web/human_gene_dict.json")
     ap.add_argument("--out-dir", type=Path, default=DEFAULT_OUT)
-    ap.add_argument("--n-cells", type=int, default=4,
-                    help="Number of cells to process (src_embeddings is ~40 MB/cell at L=2048).")
+    ap.add_argument("--n-cells", type=int, default=100,
+                    help="Number of cells to process. src_embeddings is ~40 MB/cell at L=2048, "
+                         "so for large N use --skip-src-embeddings (Phase 2/3 won't work but 4+ will).")
+    ap.add_argument("--skip-src-embeddings", action="store_true",
+                    help="Skip saving ref_src_embeddings.bin. Needed for n-cells > ~10 "
+                         "to avoid multi-GB fixtures. Phases 2/3 will be unable to run.")
     ap.add_argument("--device", default="cpu",
                     help="Device for the reference forward. Default cpu for "
                          "bit-identity with the CPU-baked protein embedding table "
@@ -172,8 +176,16 @@ def main():
     ordered_ids_old_all = np.zeros((N, L), dtype=np.int32)
     ordered_ids_new_all = np.zeros((N, L), dtype=np.int32)
     attn_mask_all = np.zeros((N, L), dtype=np.float32)
-    src_embeddings_all = np.zeros((N, L, D), dtype=np.float32)
+    if not args.skip_src_embeddings:
+        src_embeddings_all = np.zeros((N, L, D), dtype=np.float32)
+    else:
+        src_embeddings_all = None
     cell_embeddings_all = np.zeros((N, loaded.config.d_model), dtype=np.float32)
+
+    # Per-cell valid-token count for later analysis (how much padding each cell
+    # has). Drives the dynamic-seq-len optimization — real attention cost scales
+    # as O(valid²), not O(pad_length²).
+    valid_counts_all = np.zeros(N, dtype=np.int32)
 
     # Stage-3 fixtures for Phase 4+:
     #   - sample_indices: raw (sample_size,) indices into aligned gene array,
@@ -240,13 +252,15 @@ def main():
         ordered_ids_old_all[i] = input_ids_old.astype(np.int32)
         ordered_ids_new_all[i] = input_ids_new.astype(np.int32)
         attn_mask_all[i] = attn_mask
+        valid_counts_all[i] = int(attn_mask.sum())
 
         # Stage 7: run embedding_layer on old ids to get (L, 5120) post-LN.
         with torch.no_grad():
             ids_t = torch.from_numpy(input_ids_old).unsqueeze(0).to(device)  # (1, L)
             src = embedding_layer(ids_t)  # (1, L, 5120)
-        src_np = src.squeeze(0).cpu().numpy().astype(np.float32)
-        src_embeddings_all[i] = src_np
+        if src_embeddings_all is not None:
+            src_np = src.squeeze(0).cpu().numpy().astype(np.float32)
+            src_embeddings_all[i] = src_np
 
         # Transformer
         with torch.no_grad():
@@ -279,6 +293,13 @@ def main():
         arr.tofile(path)
         print(f"  {name:40s} {tuple(arr.shape)} {arr.dtype} -> {path.stat().st_size/1e6:.2f} MB")
 
+    # Valid-token stats — drive the dynamic-seq-len optimization.
+    vc = valid_counts_all
+    print(f"\nvalid tokens per cell: min={vc.min()}  max={vc.max()}  "
+          f"mean={vc.mean():.1f}  median={int(np.median(vc))}  "
+          f"p90={int(np.percentile(vc, 90))}  "
+          f"(pad_length={L}, so avg utilization {vc.mean()/L*100:.1f}%)")
+
     print("\nwriting fixtures")
     _save_bin("ref_raw_counts.bin", raw_counts_all)
     _save_bin("ref_normalized_weights.bin", norm_weights_all)
@@ -287,10 +308,25 @@ def main():
     _save_bin("ref_ordered_token_ids_old.bin", ordered_ids_old_all)
     _save_bin("ref_ordered_token_ids_new.bin", ordered_ids_new_all)
     _save_bin("ref_attention_mask.bin", attn_mask_all)
-    _save_bin("ref_src_embeddings.bin", src_embeddings_all)
+    _save_bin("ref_valid_counts.bin", valid_counts_all)
+    if src_embeddings_all is not None:
+        _save_bin("ref_src_embeddings.bin", src_embeddings_all)
     _save_bin("ref_cell_embedding.bin", cell_embeddings_all)
 
     # Manifest so the browser knows shapes/dtypes without guessing.
+    files = {
+        "ref_raw_counts.bin": {"shape": [N, G], "dtype": "float32"},
+        "ref_normalized_weights.bin": {"shape": [N, G], "dtype": "float32"},
+        "ref_sample_indices.bin": {"shape": [N, S], "dtype": "int32"},
+        "ref_chrom_order.bin": {"shape": [N, int(max_chroms)], "dtype": "int32"},
+        "ref_ordered_token_ids_old.bin": {"shape": [N, L], "dtype": "int32"},
+        "ref_ordered_token_ids_new.bin": {"shape": [N, L], "dtype": "int32"},
+        "ref_attention_mask.bin": {"shape": [N, L], "dtype": "float32"},
+        "ref_valid_counts.bin": {"shape": [N], "dtype": "int32"},
+        "ref_cell_embedding.bin": {"shape": [N, loaded.config.d_model], "dtype": "float32"},
+    }
+    if src_embeddings_all is not None:
+        files["ref_src_embeddings.bin"] = {"shape": [N, L, D], "dtype": "float32"}
     manifest = {
         "n_cells": N,
         "n_aligned_genes": G,
@@ -299,17 +335,14 @@ def main():
         "embedding_dim": D,
         "d_model": loaded.config.d_model,
         "max_chroms": int(max_chroms),
-        "files": {
-            "ref_raw_counts.bin": {"shape": [N, G], "dtype": "float32"},
-            "ref_normalized_weights.bin": {"shape": [N, G], "dtype": "float32"},
-            "ref_sample_indices.bin": {"shape": [N, S], "dtype": "int32"},
-            "ref_chrom_order.bin": {"shape": [N, int(max_chroms)], "dtype": "int32"},
-            "ref_ordered_token_ids_old.bin": {"shape": [N, L], "dtype": "int32"},
-            "ref_ordered_token_ids_new.bin": {"shape": [N, L], "dtype": "int32"},
-            "ref_attention_mask.bin": {"shape": [N, L], "dtype": "float32"},
-            "ref_src_embeddings.bin": {"shape": [N, L, D], "dtype": "float32"},
-            "ref_cell_embedding.bin": {"shape": [N, loaded.config.d_model], "dtype": "float32"},
+        "valid_tokens": {
+            "min": int(vc.min()),
+            "max": int(vc.max()),
+            "mean": float(vc.mean()),
+            "median": int(np.median(vc)),
+            "p90": int(np.percentile(vc, 90)),
         },
+        "files": files,
     }
     with open(args.out_dir / "manifest.json", "w") as f:
         json.dump(manifest, f, indent=2)
