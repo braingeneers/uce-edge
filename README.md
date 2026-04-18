@@ -2,6 +2,10 @@
 
 Exploring whether [UCE](https://github.com/snap-stanford/UCE) (Universal Cell Embedding), a single-cell RNA-seq foundation model, can run efficiently on researchers' machines — including in a web browser via ONNX Runtime Web + WebGPU.
 
+## Status
+
+The full UCE-brain pipeline (log1p normalize → weighted sampling → chromosome ordering → CLS/CHROM/PAD inserts → protein embedding gather → 8-layer transformer) now runs end-to-end in the browser on WebGPU, validated against a Python reference at every stage. **215 ms/cell** end-to-end at seq_len=2048, vs 327 ms/cell PyTorch CPU FP32 native. See [plan.md](plan.md) for the phased build-out and optimization roadmap.
+
 ## Repository structure
 
 - **UCE/** — original UCE repo (submodule), 4-layer and 33-layer models
@@ -53,6 +57,26 @@ make brain-web-bench
 # then open http://localhost:8765
 ```
 
+End-to-end browser pipeline (Phases 0–6 — see [plan.md](plan.md)):
+
+```bash
+make web-install                 # one-time: npm deps + Playwright
+
+# Phase 0-1: slice the embedding table, generate Python reference fixtures
+make brain-extract-embeddings
+make brain-reference-pipeline
+
+# Each brain-phase* builds the web bundle and runs the Playwright validator
+make brain-phase2                # transformer only (vs bit-exact reference)
+make brain-phase3                # + browser gather
+make brain-phase4                # + browser chrom-ordering / CLS-CHROM-PAD
+make brain-phase5                # + browser weighted sampling
+make brain-phase6                # + browser log1p + sum-to-1 normalize (full pipeline)
+
+# Backend/options bench (WebGPU vs WASM, batching, int8, thread counts)
+make brain-bench2
+```
+
 Individual steps:
 
 | Target | Description |
@@ -60,7 +84,9 @@ Individual steps:
 | `brain-baseline` | Run UCE-brain on MPS, save reference outputs |
 | `brain-onnx-export` | Export to ONNX (opset 17, dynamo) |
 | `brain-compare` | Compare PyTorch vs ONNX FP32 vs INT8 on CPU |
-| `brain-web-bench` | Playwright-driven WebGPU + WASM benchmarks |
+| `brain-web-bench` | Playwright-driven WebGPU + WASM benchmarks (synthetic) |
+| `brain-phase{2..6}` | Phase-by-phase browser pipeline validation vs Python reference |
+| `brain-bench2` | Backend/options benchmark (WebGPU batch size, WASM threads, int8) |
 
 ## Findings
 
@@ -73,9 +99,9 @@ Individual steps:
 | ONNX FP32 size | 373 MB | 117 MB |
 | ONNX INT8 size | 100 MB | 33 MB |
 
-### Benchmark results (MacBook Air M4, 32GB)
+### Synthetic transformer-only benchmark (MacBook Air M4, 32GB)
 
-UCE-brain 8-layer, seq_len=128, batch=1:
+UCE-brain 8-layer, seq_len=128, batch=1 (initial scoping benchmark, no preprocessing):
 
 ```
 variant                  size      time      cosine vs reference
@@ -88,13 +114,50 @@ Browser INT8 WebGPU       33 MB    173 ms    0.998644
 Browser INT8 WASM         33 MB    145 ms    0.998706
 ```
 
+### Full pipeline benchmark at real inference shape (seq_len=2048)
+
+End-to-end, raw counts → cell embedding (Phase 6, MacBook Air M4):
+
+```
+stage                          time
+log1p + sum-to-1 normalize     0.3 ms
+weighted sample + sentence     0.5 ms
+gather + transformer (WebGPU)  214 ms
+─────────────────────────────────────
+total per cell                 215 ms
+```
+
+Backend comparison at seq_len=2048 (from `make brain-bench2`):
+
+```
+config                          ms/cell
+WebGPU FP32 batch=1             215   ← default
+WebGPU FP32 batch=2             452   (O(L²) attention)
+WebGPU FP32 batch=4             349
+WebGPU INT8                     949
+WASM SIMD 1 thread              1341
+WASM SIMD 4 threads             1354  (no gain from threading)
+WASM SIMD 10 threads            1394
+PyTorch CPU FP32 (reference)    327   ← browser is 1.5× faster
+```
+
 ### Key takeaways
 
-1. **Browser inference is viable.** FP32 on WebGPU runs at 14 ms — 10x faster than Python on the same hardware, with bit-perfect numerical fidelity.
-2. **INT8 quantization is counterproductive on WebGPU.** WebGPU has no native INT8 kernels; the dequantization overhead makes it 12x slower than FP32. INT8 only helps if download size is the binding constraint.
-3. **FP32 on WebGPU is the recommended path.** 117 MB is a reasonable one-time cached download for a web application.
-4. **CoreML execution provider fails** for both UCE variants (known PyTorch TransformerEncoderLayer export issue). This doesn't block the browser path, which uses WebGPU.
-5. **UCE-brain's smaller architecture** (512 vs 1280 d_model) is the better candidate for edge deployment — 3.5x smaller with equivalent model design.
+1. **Full pipeline in the browser works.** Not just the transformer — log1p/normalize, weighted sampling with an in-JS RNG, chromosome ordering, and gather all run in TypeScript with cosine similarity against Python within the intrinsic RNG noise floor (per-cell cos 0.92–0.97 on the allen-cortex h5ad; Python-vs-Python at different seeds sits in the same range).
+2. **WebGPU batch=1 FP32 is the right default.** Batching hurts per-cell (O(L²) attention), INT8 regresses (no GPU-native int8 kernels), and WASM threading is flat. Graph-optimization levels make no difference — the exported model is already fused.
+3. **FP32 is faster than a local Python reference.** 215 ms/cell WebGPU vs 327 ms/cell PyTorch CPU FP32 on the same hardware. A 100-cell h5ad processes in ~22 s in-browser.
+4. **First-visit cost is the real UX issue.** ~400 MB protein embedding table + 117 MB model download, then HTTP-cached. Runtime per-tab GPU peak ~1 GB.
+5. **WASM threading requires cross-origin isolation.** Without COOP/COEP headers, `ort.env.wasm.numThreads` is silently ignored. The dev server in `scripts/brain_web_bench2.py` sends the right headers; a deployed app must too. Even with threading properly enabled it didn't help this model.
+6. **UCE-brain's smaller architecture** (8 layers, d_model=512) is the right candidate for edge deployment — 3.5× smaller than the original UCE with equivalent design.
+
+### Optimization headroom (not yet implemented)
+
+Ranked effort:payoff — see [plan.md](plan.md) for detail:
+
+- **Dynamic seq_len** (skip padded tokens): real cells are ~1100 valid of 2048 tokens; attention is O(L²), so trimming gets ~3× on the dominant cost. Estimated **~100 ms/cell**.
+- **FP16 WebGPU weights**: transformer is memory-bandwidth-bound; halving weights roughly halves kernel time. Combines with the above toward **~60 ms/cell**.
+- **GPU-resident embedding table + persistent session**: do the 5120-wide gather on GPU instead of shipping src through CPU; pool tensors across runs. Modest latency win, much lower memory churn.
+- **`enableGraphCapture: true`** on WebGPU once shapes are stable. 10–30% per ORT docs, untested here.
 
 ### Full 33-layer UCE feasibility
 
@@ -107,7 +170,8 @@ The original 33-layer UCE model is not a viable candidate for browser deployment
 
 ### What's not yet covered
 
-- Real scRNA input (experiments use synthetic data to isolate the model inference path)
-- Protein embedding lookup in the browser (the 145K x 5120 embedding table is ~2.8 GB and kept outside the ONNX graph)
-- End-to-end preprocessing pipeline in JavaScript
-- Scaling behavior at full seq_len=1024 or seq_len=2048
+- Native h5ad parsing in the browser (the pipeline assumes the caller provides `(gene_symbols[], raw_counts[N,G])` in memory however they got there).
+- Non-human species.
+- The expression-prediction head (embedding extraction only).
+- A polished demo UI — the phase*.html pages are validation harnesses, not product.
+- The optimization phases listed above.
